@@ -1,0 +1,15 @@
+# Database credentials
+db.php
+
+# Backup files
+*.bak
+*.backup
+*.sql
+
+# OS junk files
+.DS_Store
+Thumbs.db
+
+# Editor temp files
+*.swp
+*~

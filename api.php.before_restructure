@@ -1,0 +1,561 @@
+<?php
+ob_start();
+ini_set('display_errors', 0);
+ini_set('log_errors', 1);
+error_reporting(E_ALL);
+session_start();
+require_once 'db.php';
+
+function isLoggedIn()     { return isset($_SESSION['user_id']); }
+function getUserRole()    { return $_SESSION['role'] ?? null; }
+function canEdit()        { $r = getUserRole(); return $r === 'admin' || $r === 'manager'; }
+function canDelete()      { return getUserRole() === 'admin'; }
+function canExport()      { $r = getUserRole(); return $r === 'admin' || $r === 'manager'; }
+function canManageUsers() { return getUserRole() === 'admin'; }
+
+function jsonOut($data, $code = 200) {
+    ob_clean();
+    http_response_code($code);
+    header('Content-Type: application/json');
+    echo json_encode($data);
+    exit;
+}
+
+function normalizeUsername($username) {
+    return preg_replace('/\s+/', '_', trim($username));
+}
+
+// Re-read role from DB to heal stale sessions.
+// Called on every request where a session exists.
+function refreshSessionRole($pdo) {
+    if (!isset($_SESSION['user_id'])) return;
+    $stmt = $pdo->prepare("SELECT role, username FROM users WHERE id = ?");
+    $stmt->execute([$_SESSION['user_id']]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    if ($user) {
+        $_SESSION['role']     = $user['role'];
+        $_SESSION['username'] = $user['username'];
+    } else {
+        // User was deleted — destroy the session
+        session_destroy();
+        jsonOut(['error' => 'Session expired. Please log in again.'], 401);
+    }
+}
+
+header('Content-Type: application/json');
+
+$method   = $_SERVER['REQUEST_METHOD'];
+$request  = explode('/', trim($_SERVER['PATH_INFO'] ?? '', '/'));
+$resource = $request[0] ?? '';
+$id       = $request[1] ?? null;
+
+// Auth gate
+if ($resource !== 'login') {
+    if (!isLoggedIn()) {
+        jsonOut(['error' => 'Unauthorized'], 401);
+    }
+    // Always refresh role from DB on every request
+    // This heals stale sessions caused by file replacement or role changes
+    refreshSessionRole($pdo);
+}
+
+function logActivity($pdo, $action, $module) {
+    $stmt = $pdo->prepare("INSERT INTO activity_log (user_id, action, module) VALUES (?, ?, ?)");
+    $stmt->execute([$_SESSION['user_id'], $action, $module]);
+}
+
+switch ($resource) {
+
+    // ---------- LOGIN ----------
+    case 'login':
+        if ($method !== 'POST') jsonOut(['error' => 'Method not allowed'], 405);
+        $input    = json_decode(file_get_contents('php://input'), true);
+        $username = normalizeUsername($input['username'] ?? '');
+        $password = $input['password'] ?? '';
+        if (!$username || !$password) {
+            jsonOut(['error' => 'Username and password are required'], 400);
+        }
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE username = ?");
+        $stmt->execute([$username]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        // Fallback: try raw trimmed username (for accounts still with spaces in DB)
+        if (!$user) {
+            $rawTrimmed = trim($input['username'] ?? '');
+            $stmt->execute([$rawTrimmed]);
+            $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        }
+        if ($user && password_verify($password, $user['password_hash'])) {
+            session_regenerate_id(true); // prevent session fixation
+            $_SESSION['user_id']  = $user['id'];
+            $_SESSION['username'] = $user['username'];
+            $_SESSION['role']     = $user['role'];
+            jsonOut(['success' => true, 'role' => $user['role'], 'username' => $user['username']]);
+        }
+        jsonOut(['error' => 'Invalid credentials'], 401);
+        break;
+
+    // ---------- LOGOUT ----------
+    case 'logout':
+        session_destroy();
+        jsonOut(['success' => true]);
+        break;
+
+    // ---------- WHOAMI (session check / refresh) ----------
+    case 'whoami':
+        if ($method !== 'GET') jsonOut(['error' => 'Method not allowed'], 405);
+        jsonOut([
+            'user_id'  => $_SESSION['user_id'],
+            'username' => $_SESSION['username'],
+            'role'     => $_SESSION['role']
+        ]);
+        break;
+
+    // ---------- USERS ----------
+    case 'users':
+        if ($method === 'GET') {
+            if (!canManageUsers()) jsonOut(['error' => 'Permission denied — admin role required'], 403);
+            $stmt = $pdo->query("SELECT id, username, role, email FROM users ORDER BY username");
+            jsonOut($stmt->fetchAll(PDO::FETCH_ASSOC));
+
+        } elseif ($method === 'POST') {
+            if (!canManageUsers()) jsonOut(['error' => 'Permission denied — admin role required'], 403);
+            $input    = json_decode(file_get_contents('php://input'), true);
+            $username = normalizeUsername($input['username'] ?? '');
+            $password = $input['password'] ?? '';
+            $role     = $input['role']  ?? 'staff';
+            $email    = $input['email'] ?? null;
+            if (!$username || !$password) {
+                jsonOut(['error' => 'Username and password required'], 400);
+            }
+            // Duplicate check
+            $check = $pdo->prepare("SELECT id FROM users WHERE username = ?");
+            $check->execute([$username]);
+            if ($check->fetch()) {
+                jsonOut(['error' => "Username '$username' already exists"], 409);
+            }
+            $hash  = password_hash($password, PASSWORD_DEFAULT);
+            $newId = uniqid();
+            $stmt  = $pdo->prepare("INSERT INTO users (id, username, password_hash, role, email) VALUES (?,?,?,?,?)");
+            $stmt->execute([$newId, $username, $hash, $role, $email]);
+            logActivity($pdo, "Added user $username ($role)", 'users');
+            jsonOut(['success' => true, 'username' => $username]);
+
+        } elseif ($method === 'DELETE' && $id) {
+            if (!canManageUsers()) jsonOut(['error' => 'Permission denied — admin role required'], 403);
+            if ($id === 'admin') jsonOut(['error' => 'Cannot delete the protected admin account'], 403);
+            $stmt = $pdo->prepare("DELETE FROM users WHERE username = ?");
+            $stmt->execute([$id]);
+            logActivity($pdo, "Deleted user $id", 'users');
+            jsonOut(['success' => true]);
+
+        } else {
+            jsonOut(['error' => 'Method not allowed'], 405);
+        }
+        break;
+
+    // ---------- USER ROLE ----------
+    case 'users/role':
+        if ($method !== 'POST') jsonOut(['error' => 'Method not allowed'], 405);
+        if (!canManageUsers()) jsonOut(['error' => 'Permission denied — admin role required'], 403);
+        $input = json_decode(file_get_contents('php://input'), true);
+        $allowed = ['admin','manager','staff'];
+        if (!in_array($input['role'] ?? '', $allowed)) jsonOut(['error' => 'Invalid role'], 400);
+        $stmt = $pdo->prepare("UPDATE users SET role = ? WHERE username = ?");
+        $stmt->execute([$input['role'], $input['username']]);
+        logActivity($pdo, "Changed role of {$input['username']} to {$input['role']}", 'users');
+        jsonOut(['success' => true]);
+        break;
+
+    // ---------- USER RESET PASSWORD ----------
+    case 'users/reset-password':
+        if ($method !== 'POST') jsonOut(['error' => 'Method not allowed'], 405);
+        if (!canManageUsers()) jsonOut(['error' => 'Permission denied — admin role required'], 403);
+        $input = json_decode(file_get_contents('php://input'), true);
+        if (empty($input['password'])) jsonOut(['error' => 'Password required'], 400);
+        $hash = password_hash($input['password'], PASSWORD_DEFAULT);
+        $stmt = $pdo->prepare("UPDATE users SET password_hash = ? WHERE username = ?");
+        $stmt->execute([$hash, $input['username']]);
+        logActivity($pdo, "Reset password for {$input['username']}", 'users');
+        jsonOut(['success' => true]);
+        break;
+
+    // ---------- CHANGE PASSWORD ----------
+    case 'change-password':
+        if ($method !== 'POST') jsonOut(['error' => 'Method not allowed'], 405);
+        $input = json_decode(file_get_contents('php://input'), true);
+        $old   = $input['old'] ?? '';
+        $new   = $input['new'] ?? '';
+        if (!$old || !$new) jsonOut(['error' => 'Old and new password required'], 400);
+        $stmt = $pdo->prepare("SELECT password_hash FROM users WHERE id = ?");
+        $stmt->execute([$_SESSION['user_id']]);
+        $user = $stmt->fetch();
+        if ($user && password_verify($old, $user['password_hash'])) {
+            $newHash = password_hash($new, PASSWORD_DEFAULT);
+            $upd = $pdo->prepare("UPDATE users SET password_hash = ? WHERE id = ?");
+            $upd->execute([$newHash, $_SESSION['user_id']]);
+            logActivity($pdo, "Changed own password", 'users');
+            jsonOut(['success' => true]);
+        }
+        jsonOut(['error' => 'Current password incorrect'], 401);
+        break;
+
+    // ---------- NOTIFICATIONS ----------
+    case 'notifications':
+        if ($method !== 'GET') jsonOut(['error' => 'Method not allowed'], 405);
+        $stmt = $pdo->prepare("SELECT action, module, created_at FROM activity_log WHERE user_id = ? ORDER BY created_at DESC LIMIT 20");
+        $stmt->execute([$_SESSION['user_id']]);
+        $notifs = array_map(fn($l) => ['message' => $l['action'], 'module' => $l['module'], 'type' => 'blue'], $stmt->fetchAll(PDO::FETCH_ASSOC));
+        jsonOut(['notifications' => $notifs]);
+        break;
+
+    // ---------- ACTIVITY LOG ----------
+    case 'activity-log':
+        if ($method !== 'GET') jsonOut(['error' => 'Method not allowed'], 405);
+        $stmt = $pdo->prepare("SELECT action, module, created_at FROM activity_log WHERE user_id = ? ORDER BY created_at DESC LIMIT 20");
+        $stmt->execute([$_SESSION['user_id']]);
+        jsonOut($stmt->fetchAll(PDO::FETCH_ASSOC));
+        break;
+
+    // ---------- BULK DELETE ----------
+    case 'bulk-delete':
+        if ($method !== 'POST') jsonOut(['error' => 'Method not allowed'], 405);
+        if (!canDelete()) jsonOut(['error' => 'Permission denied'], 403);
+        $input   = json_decode(file_get_contents('php://input'), true);
+        $module  = $input['module'] ?? '';
+        $ids     = $input['ids']    ?? [];
+        $allowed = ['inventory','tasks','employees','sales','expenses','returns'];
+        if (!in_array($module, $allowed) || !is_array($ids) || count($ids) === 0) {
+            jsonOut(['error' => 'Invalid request'], 400);
+        }
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $stmt = $pdo->prepare("DELETE FROM $module WHERE id IN ($placeholders)");
+        $stmt->execute($ids);
+        jsonOut(['success' => true]);
+        break;
+
+    // ---------- INVENTORY ----------
+    case 'inventory':
+        if ($method === 'GET') {
+            $stmt = $pdo->query("SELECT * FROM inventory ORDER BY name LIMIT 100");
+            jsonOut($stmt->fetchAll(PDO::FETCH_ASSOC));
+
+        } elseif ($method === 'POST') {
+            $data = json_decode(file_get_contents('php://input'), true);
+
+            if (getUserRole() === 'staff') {
+                if (empty($data['id'])) jsonOut(['error' => 'Staff cannot create inventory items'], 403);
+                $stmt = $pdo->prepare("UPDATE inventory SET qty = ? WHERE id = ?");
+                $stmt->execute([$data['qty'] ?? 0, $data['id']]);
+                logActivity($pdo, "Updated quantity of inventory item {$data['id']}", 'inventory');
+                jsonOut(['success' => true, 'id' => $data['id']]);
+            }
+
+            if (!canEdit()) jsonOut(['error' => 'Permission denied'], 403);
+
+            $name      = $data['name']      ?? '';
+            $sku       = $data['sku']       ?? null;
+            $category  = $data['category']  ?? null;
+            $qty       = (int)($data['qty'] ?? 0);
+            $price     = (float)($data['cost'] ?? $data['price'] ?? 0);
+            $sellprice = (float)($data['sellprice'] ?? 0);
+
+            if (!empty($data['id'])) {
+                $stmt = $pdo->prepare("UPDATE inventory SET name=?, sku=?, category=?, qty=?, price=?, sellprice=? WHERE id=?");
+                $stmt->execute([$name, $sku, $category, $qty, $price, $sellprice, $data['id']]);
+                logActivity($pdo, "Edited inventory $name", 'inventory');
+                jsonOut(['success' => true, 'id' => $data['id']]);
+            } else {
+                $newId = uniqid();
+                $stmt  = $pdo->prepare("INSERT INTO inventory (id, name, sku, category, qty, price, sellprice) VALUES (?,?,?,?,?,?,?)");
+                $stmt->execute([$newId, $name, $sku, $category, $qty, $price, $sellprice]);
+                logActivity($pdo, "Added inventory $name", 'inventory');
+                if ($price > 0 && $qty > 0) {
+                    $totalCost = $price * $qty;
+                    $expId     = uniqid();
+                    $expStmt   = $pdo->prepare("INSERT INTO expenses (id, description, category, amount, status, expense_date, invId) VALUES (?,?,?,?,?,?,?)");
+                    $expStmt->execute([$expId, "Inventory cost: $name", 'Inventory', $totalCost, 'approved', date('Y-m-d'), $newId]);
+                    logActivity($pdo, "Auto-created expense for inventory $name (total: $totalCost)", 'expenses');
+                }
+                jsonOut(['success' => true, 'id' => $newId]);
+            }
+
+        } elseif ($method === 'DELETE' && $id) {
+            if (!canDelete()) jsonOut(['error' => 'Permission denied'], 403);
+            $stmt = $pdo->prepare("DELETE FROM inventory WHERE id = ?");
+            $stmt->execute([$id]);
+            logActivity($pdo, "Deleted inventory item", 'inventory');
+            jsonOut(['success' => true]);
+        }
+        break;
+
+    // ---------- TASKS ----------
+    case 'tasks':
+        if ($method === 'GET') {
+            if (getUserRole() === 'staff') {
+                $stmt = $pdo->prepare("SELECT * FROM tasks WHERE assignee = ? ORDER BY created_at DESC LIMIT 100");
+                $stmt->execute([$_SESSION['username']]);
+            } else {
+                $stmt = $pdo->query("SELECT * FROM tasks ORDER BY created_at DESC LIMIT 100");
+            }
+            jsonOut($stmt->fetchAll(PDO::FETCH_ASSOC));
+
+        } elseif ($method === 'POST') {
+            $data = json_decode(file_get_contents('php://input'), true);
+            $data['title']    = trim($data['title']    ?? '');
+            $data['assignee'] = ($data['assignee'] ?? '') === '' ? null : $data['assignee'];
+            $data['due']      = ($data['due']      ?? '') === '' ? null : $data['due'];
+            $data['status']   = $data['status']   ?? 'todo';
+            $data['priority'] = $data['priority'] ?? 'medium';
+            $data['notes']    = ($data['notes']    ?? '') === '' ? null : $data['notes'];
+            $data['comments'] = ($data['comments'] ?? '') === '' ? null : $data['comments'];
+
+            if (getUserRole() === 'staff') {
+                if (empty($data['id'])) jsonOut(['error' => 'Staff cannot create tasks'], 403);
+                $check = $pdo->prepare("SELECT assignee FROM tasks WHERE id = ?");
+                $check->execute([$data['id']]);
+                $task = $check->fetch();
+                if (!$task || $task['assignee'] !== $_SESSION['username']) {
+                    jsonOut(['error' => 'You can only update your own tasks'], 403);
+                }
+                $stmt = $pdo->prepare("UPDATE tasks SET status = ? WHERE id = ?");
+                $stmt->execute([$data['status'], $data['id']]);
+                logActivity($pdo, "Updated task status to {$data['status']}", 'tasks');
+                jsonOut(['success' => true, 'id' => $data['id']]);
+            }
+
+            if (!canEdit()) jsonOut(['error' => 'Permission denied'], 403);
+
+            if (!empty($data['id'])) {
+                $stmt = $pdo->prepare("UPDATE tasks SET title=?, assignee=?, due=?, status=?, priority=?, notes=?, comments=? WHERE id=?");
+                $stmt->execute([$data['title'], $data['assignee'], $data['due'], $data['status'], $data['priority'], $data['notes'], $data['comments'], $data['id']]);
+                logActivity($pdo, "Edited task {$data['title']}", 'tasks');
+                jsonOut(['success' => true, 'id' => $data['id']]);
+            } else {
+                $newId = uniqid();
+                $stmt  = $pdo->prepare("INSERT INTO tasks (id, title, assignee, due, status, priority, notes, comments) VALUES (?,?,?,?,?,?,?,?)");
+                $stmt->execute([$newId, $data['title'], $data['assignee'], $data['due'], $data['status'], $data['priority'], $data['notes'], $data['comments']]);
+                logActivity($pdo, "Added task {$data['title']}", 'tasks');
+                jsonOut(['success' => true, 'id' => $newId]);
+            }
+
+        } elseif ($method === 'DELETE' && $id) {
+            if (!canDelete()) jsonOut(['error' => 'Permission denied'], 403);
+            $stmt = $pdo->prepare("DELETE FROM tasks WHERE id = ?");
+            $stmt->execute([$id]);
+            logActivity($pdo, "Deleted task", 'tasks');
+            jsonOut(['success' => true]);
+        }
+        break;
+
+    // ---------- EMPLOYEES ----------
+    case 'employees':
+        if ($method === 'GET') {
+            $stmt = $pdo->query("SELECT * FROM employees ORDER BY name LIMIT 100");
+            jsonOut($stmt->fetchAll(PDO::FETCH_ASSOC));
+
+        } elseif ($method === 'POST') {
+            if (!canEdit()) jsonOut(['error' => 'Permission denied'], 403);
+            $data   = json_decode(file_get_contents('php://input'), true);
+            $name   = $data['name']   ?? '';
+            $dept   = $data['dept']   ?? null;
+            $role   = $data['role']   ?? null;
+            $email  = $data['email']  ?? null;
+            $phone  = $data['phone']  ?? null;
+            $status = $data['status'] ?? 'active';
+
+            if (!empty($data['id'])) {
+                $stmt = $pdo->prepare("UPDATE employees SET name=?, dept=?, role=?, email=?, phone=?, status=? WHERE id=?");
+                $stmt->execute([$name, $dept, $role, $email, $phone, $status, $data['id']]);
+                logActivity($pdo, "Edited employee $name", 'employees');
+                jsonOut(['success' => true, 'id' => $data['id']]);
+            } else {
+                $newId = uniqid();
+                $stmt  = $pdo->prepare("INSERT INTO employees (id, name, dept, role, email, phone, status) VALUES (?,?,?,?,?,?,?)");
+                $stmt->execute([$newId, $name, $dept, $role, $email, $phone, $status]);
+                logActivity($pdo, "Added employee $name", 'employees');
+                jsonOut(['success' => true, 'id' => $newId]);
+            }
+
+        } elseif ($method === 'DELETE' && $id) {
+            if (!canDelete()) jsonOut(['error' => 'Permission denied'], 403);
+            $stmt = $pdo->prepare("DELETE FROM employees WHERE id = ?");
+            $stmt->execute([$id]);
+            logActivity($pdo, "Deleted employee", 'employees');
+            jsonOut(['success' => true]);
+        }
+        break;
+
+    // ---------- SALES ----------
+    case 'sales':
+        if ($method === 'GET') {
+            $stmt = $pdo->query("SELECT * FROM sales ORDER BY sale_date DESC LIMIT 100");
+            jsonOut($stmt->fetchAll(PDO::FETCH_ASSOC));
+
+        } elseif ($method === 'POST') {
+            if (!canEdit()) jsonOut(['error' => 'Permission denied'], 403);
+            $data      = json_decode(file_get_contents('php://input'), true);
+            $qty       = (float)($data['qty']       ?? 0);
+            $unitprice = (float)($data['unitprice']  ?? 0);
+            $unitcost  = (float)($data['unitcost']   ?? 0);
+            $amount    = $qty * $unitprice;
+            $cost      = $qty * $unitcost;
+            $platform  = $data['platform']  ?? null;
+            $invId     = $data['invId']     ?? null;
+            $product   = $data['product']   ?? null;
+            $saleDate  = $data['sale_date'] ?? null;
+            $notes     = ($data['notes'] ?? '') === '' ? null : $data['notes'];
+
+            if (!empty($data['id'])) {
+                $stmt = $pdo->prepare("UPDATE sales SET platform=?, invId=?, product=?, qty=?, unitprice=?, unitcost=?, amount=?, cost=?, sale_date=?, notes=? WHERE id=?");
+                $stmt->execute([$platform, $invId, $product, $qty, $unitprice, $unitcost, $amount, $cost, $saleDate, $notes, $data['id']]);
+                logActivity($pdo, "Edited sale", 'sales');
+                jsonOut(['success' => true, 'id' => $data['id']]);
+            } else {
+                $newId = uniqid();
+                $stmt  = $pdo->prepare("INSERT INTO sales (id, platform, invId, product, qty, unitprice, unitcost, amount, cost, sale_date, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?)");
+                $stmt->execute([$newId, $platform, $invId, $product, $qty, $unitprice, $unitcost, $amount, $cost, $saleDate, $notes]);
+                logActivity($pdo, "Added sale", 'sales');
+                jsonOut(['success' => true, 'id' => $newId]);
+            }
+
+        } elseif ($method === 'DELETE' && $id) {
+            if (!canDelete()) jsonOut(['error' => 'Permission denied'], 403);
+            $stmt = $pdo->prepare("DELETE FROM sales WHERE id = ?");
+            $stmt->execute([$id]);
+            logActivity($pdo, "Deleted sale", 'sales');
+            jsonOut(['success' => true]);
+        }
+        break;
+
+    // ---------- EXPENSES ----------
+    case 'expenses':
+        if ($method === 'GET') {
+            $stmt = $pdo->query("SELECT * FROM expenses ORDER BY expense_date DESC LIMIT 100");
+            jsonOut($stmt->fetchAll(PDO::FETCH_ASSOC));
+
+        } elseif ($method === 'POST') {
+            if (!canEdit()) jsonOut(['error' => 'Permission denied'], 403);
+            $data        = json_decode(file_get_contents('php://input'), true);
+            $description = $data['description']  ?? null;
+            $category    = $data['category']     ?? null;
+            $amount      = (float)($data['amount'] ?? 0);
+            $status      = $data['status']       ?? 'pending';
+            $expenseDate = $data['expense_date'] ?? null;
+            $invId       = $data['invId']        ?? null;
+
+            if (!empty($data['id'])) {
+                $stmt = $pdo->prepare("UPDATE expenses SET description=?, category=?, amount=?, status=?, expense_date=?, invId=? WHERE id=?");
+                $stmt->execute([$description, $category, $amount, $status, $expenseDate, $invId, $data['id']]);
+                logActivity($pdo, "Edited expense", 'expenses');
+                jsonOut(['success' => true, 'id' => $data['id']]);
+            } else {
+                $newId = uniqid();
+                $stmt  = $pdo->prepare("INSERT INTO expenses (id, description, category, amount, status, expense_date, invId) VALUES (?,?,?,?,?,?,?)");
+                $stmt->execute([$newId, $description, $category, $amount, $status, $expenseDate, $invId]);
+                logActivity($pdo, "Added expense", 'expenses');
+                jsonOut(['success' => true, 'id' => $newId]);
+            }
+
+        } elseif ($method === 'DELETE' && $id) {
+            if (!canDelete()) jsonOut(['error' => 'Permission denied'], 403);
+            $stmt = $pdo->prepare("DELETE FROM expenses WHERE id = ?");
+            $stmt->execute([$id]);
+            logActivity($pdo, "Deleted expense", 'expenses');
+            jsonOut(['success' => true]);
+        }
+        break;
+
+    // ---------- RETURNS ----------
+    case 'returns':
+        if ($method === 'GET') {
+            $stmt = $pdo->query("SELECT * FROM returns ORDER BY return_date DESC LIMIT 100");
+            jsonOut($stmt->fetchAll(PDO::FETCH_ASSOC));
+
+        } elseif ($method === 'POST') {
+            if (!canEdit()) jsonOut(['error' => 'Permission denied'], 403);
+            $data        = json_decode(file_get_contents('php://input'), true);
+            $refundAmt   = (float)($data['refund_amount']          ?? 0);
+            $shippingCost= (float)($data['return_shipping_cost']   ?? 0);
+            $restockCost = (float)($data['restocking_labor_cost']  ?? 0);
+            $disposalFee = (float)($data['disposal_fee']           ?? 0);
+            $origCogs    = (float)($data['original_cogs']          ?? 0);
+            $salvageVal  = (float)($data['salvage_value_recovered'] ?? 0);
+            $totalLoss   = $refundAmt + $shippingCost + $restockCost + $disposalFee + ($origCogs - $salvageVal);
+            $returnId    = $data['return_id']            ?? null;
+            $origSaleId  = $data['original_sale_id']     ?? null;
+            $productSku  = $data['product_sku']          ?? null;
+            $returnQty   = (int)($data['return_quantity'] ?? 0);
+            $reasonCode  = $data['return_reason_code']   ?? null;
+            $condGrade   = $data['condition_grade']      ?? null;
+            $returnDate  = $data['return_date']          ?? null;
+            $disposCode  = $data['disposition_code']     ?? null;
+            $inspNotes   = $data['inspection_notes']     ?? null;
+            $status      = $data['status']               ?? 'pending';
+
+            if (!empty($data['id'])) {
+                $stmt = $pdo->prepare("UPDATE returns SET return_id=?, original_sale_id=?, product_sku=?, return_quantity=?, return_reason_code=?, condition_grade=?, refund_amount=?, return_shipping_cost=?, restocking_labor_cost=?, disposal_fee=?, original_cogs=?, salvage_value_recovered=?, return_date=?, disposition_code=?, inspection_notes=?, status=?, total_loss=? WHERE id=?");
+                $stmt->execute([$returnId, $origSaleId, $productSku, $returnQty, $reasonCode, $condGrade, $refundAmt, $shippingCost, $restockCost, $disposalFee, $origCogs, $salvageVal, $returnDate, $disposCode, $inspNotes, $status, $totalLoss, $data['id']]);
+                logActivity($pdo, "Edited return", 'returns');
+                jsonOut(['success' => true, 'id' => $data['id']]);
+            } else {
+                $newId = uniqid();
+                $stmt  = $pdo->prepare("INSERT INTO returns (id, return_id, original_sale_id, product_sku, return_quantity, return_reason_code, condition_grade, refund_amount, return_shipping_cost, restocking_labor_cost, disposal_fee, original_cogs, salvage_value_recovered, return_date, disposition_code, inspection_notes, status, total_loss) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                $stmt->execute([$newId, $returnId, $origSaleId, $productSku, $returnQty, $reasonCode, $condGrade, $refundAmt, $shippingCost, $restockCost, $disposalFee, $origCogs, $salvageVal, $returnDate, $disposCode, $inspNotes, $status, $totalLoss]);
+                logActivity($pdo, "Added return", 'returns');
+                jsonOut(['success' => true, 'id' => $newId]);
+            }
+
+        } elseif ($method === 'DELETE' && $id) {
+            if (!canDelete()) jsonOut(['error' => 'Permission denied'], 403);
+            $stmt = $pdo->prepare("DELETE FROM returns WHERE id = ?");
+            $stmt->execute([$id]);
+            logActivity($pdo, "Deleted return", 'returns');
+            jsonOut(['success' => true]);
+        }
+        break;
+
+    // ---------- RETURNS ANALYTICS ----------
+    case 'returns-analytics':
+        if ($method !== 'GET') jsonOut(['error' => 'Method not allowed'], 405);
+        $byReason = $pdo->query("
+            SELECT COALESCE(return_reason_code, 'Unknown') AS reason,
+                   SUM(total_loss) AS loss
+            FROM returns GROUP BY reason
+        ")->fetchAll(PDO::FETCH_ASSOC);
+        $byMonth = $pdo->query("
+            SELECT DATE_FORMAT(return_date, '%Y-%m') AS month,
+                   SUM(total_loss) AS loss
+            FROM returns WHERE return_date IS NOT NULL
+            GROUP BY month ORDER BY month
+        ")->fetchAll(PDO::FETCH_ASSOC);
+        $reason = [];
+        foreach ($byReason as $r) $reason[$r['reason']] = floatval($r['loss']);
+        $month = [];
+        foreach ($byMonth as $r) $month[$r['month']] = floatval($r['loss']);
+        jsonOut(['reason' => $reason, 'month' => $month]);
+        break;
+
+    // ---------- DASHBOARD ----------
+    case 'dashboard':
+        if ($method !== 'GET') jsonOut(['error' => 'Method not allowed'], 405);
+        $invTotal   = $pdo->query("SELECT SUM(price * qty) AS val FROM inventory")->fetch()['val'] ?? 0;
+        $salesRev   = $pdo->query("SELECT SUM(amount) AS val FROM sales")->fetch()['val'] ?? 0;
+        $salesCost  = $pdo->query("SELECT SUM(cost) AS val FROM sales")->fetch()['val'] ?? 0;
+        $profit     = $salesRev - $salesCost;
+        $expTotal   = $pdo->query("SELECT SUM(amount) AS val FROM expenses")->fetch()['val'] ?? 0;
+        $returnLoss = $pdo->query("SELECT SUM(total_loss) AS val FROM returns WHERE status='approved'")->fetch()['val'] ?? 0;
+        $lowStock   = $pdo->query("SELECT COUNT(*) AS cnt FROM inventory WHERE qty < 5")->fetch()['cnt'] ?? 0;
+        $openTasks  = $pdo->query("SELECT COUNT(*) AS cnt FROM tasks WHERE status != 'done'")->fetch()['cnt'] ?? 0;
+        $monthly    = $pdo->query("
+            SELECT DATE_FORMAT(sale_date,'%Y-%m') AS month, SUM(amount) AS rev, SUM(cost) AS cost
+            FROM sales WHERE sale_date IS NOT NULL AND sale_date <= CURDATE()
+            GROUP BY month ORDER BY month DESC LIMIT 12
+        ")->fetchAll(PDO::FETCH_ASSOC);
+        jsonOut(['invTotal' => $invTotal, 'salesRev' => $salesRev, 'profit' => $profit,
+                 'expTotal' => $expTotal, 'returnLoss' => $returnLoss,
+                 'lowStock' => $lowStock, 'openTasks' => $openTasks, 'monthly' => $monthly]);
+        break;
+
+    default:
+        jsonOut(['error' => 'Not found'], 404);
+}
